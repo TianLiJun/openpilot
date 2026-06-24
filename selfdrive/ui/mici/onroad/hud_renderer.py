@@ -116,7 +116,7 @@ class HudRenderer(Widget):
     self._can_draw_top_icons = True
     self._show_wheel_critical = False
 
-    self._model_hist: deque = deque()  # (monotonic_t, exec_ms, frameDropPerc) for rolling 60s peaks
+    self._usb_hist: deque = deque()    # (monotonic_t, linkErrorCount) for the live link-error rate
 
     self._font_bold: rl.Font = gui_app.font(FontWeight.BOLD)
     self._font_medium: rl.Font = gui_app.font(FontWeight.MEDIUM)
@@ -189,54 +189,61 @@ class HudRenderer(Widget):
     self._draw_model_source(rect)
 
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
-    """Two lines: the eGPU state (off, loading, on, failed) and the model actually driving plus its
-    health. so the eGPU status is always visible even when no eGPU is connected."""
+    """Top-left box: eGPU state, the model actually driving, and the USB link stability counters
+    (the link state + the events that matter for a marginal cable). Always visible."""
     sm = ui_state.sm
+    lines: list[tuple[str, rl.Color]] = []
+
     if not ui_state.usbgpu:
-      egpu_text, egpu_color = "eGPU: off", COLORS.WHITE_TRANSLUCENT
+      lines.append(("eGPU: off", COLORS.WHITE_TRANSLUCENT))
     elif ui_state.usbgpu_failed or not ui_state.usbgpu_compiled:
-      egpu_text, egpu_color = "eGPU: failed", COLORS.MODEL_RED
+      lines.append(("eGPU: failed", COLORS.MODEL_RED))
     elif not ui_state.usbgpu_active:
-      egpu_text, egpu_color = "eGPU: loading", COLORS.WHITE
+      lines.append(("eGPU: loading", COLORS.WHITE))
     else:
-      egpu_text, egpu_color = "eGPU: on", COLORS.MODEL_GREEN
+      lines.append(("eGPU: on", COLORS.MODEL_GREEN))
 
     driver = "big" if (ui_state.usbgpu and ui_state.usbgpu_active) else "small"
     if not sm.alive["modelV2"] or sm.recv_frame["modelV2"] < ui_state.started_frame:
-      model_text, model_color = f"{driver}: loading", COLORS.WHITE
+      lines.append((f"{driver}: loading", COLORS.WHITE))
     elif any(e.name == EventName.modeldLagging for e in sm["onroadEvents"]):
-      model_text, model_color = f"{driver}: lagging", COLORS.MODEL_RED
+      lines.append((f"{driver}: lagging", COLORS.MODEL_RED))
     else:
-      model_text, model_color = f"{driver}: {sm['modelV2'].modelExecutionTime * 1000:.0f} ms", COLORS.MODEL_GREEN
+      lines.append((f"{driver}: {sm['modelV2'].modelExecutionTime * 1000:.0f} ms", COLORS.MODEL_GREEN))
 
-    # lines 3 + 4: peak exec time and peak frame-drop %, both over a rolling 60s window, to catch big-model stalls.
-    # append every render (no frameId dependency - frameId resets on model restart broke that) and prune by wall-clock
-    now = time.monotonic()
-    mv2 = sm["modelV2"]
-    self._model_hist.append((now, mv2.modelExecutionTime * 1000.0, mv2.frameDropPerc))
-    while self._model_hist and now - self._model_hist[0][0] > 60.0:
-      self._model_hist.popleft()
-    max_exec_ms = max((e for _, e, _ in self._model_hist), default=0.0)
-    max_drop = max((d for _, _, d in self._model_hist), default=0.0)
-    peak_text = f"max: {max_exec_ms:.0f} ms"
-    drop_text = f"drop: {max_drop:.0f}%"
-    info_color = COLORS.WHITE_TRANSLUCENT
+    # USB link stability - the counters that matter for a marginal cable
+    us = sm["usbState"]
+    if not sm.alive["usbState"] or not us.connected or us.speedMbps == 0:  # no SuperSpeed link -> off
+      lines.append(("usb link: off", COLORS.WHITE_TRANSLUCENT))
+    else:
+      now = time.monotonic()
+      self._usb_hist.append((now, us.linkErrorCount))
+      while self._usb_hist and now - self._usb_hist[0][0] > 5.0:
+        self._usb_hist.popleft()
+      rate = 0.0
+      if len(self._usb_hist) >= 2:
+        dt = self._usb_hist[-1][0] - self._usb_hist[0][0]
+        dc = self._usb_hist[-1][1] - self._usb_hist[0][1]
+        rate = dc / dt if dt > 0 and dc >= 0 else 0.0
+      ltssm = str(us.ltssmState)
+      link_color = COLORS.MODEL_GREEN if (ltssm == "u0" and rate < 20) else COLORS.MODEL_RED
+      lines.append((f"usb link: {ltssm}  {rate:.0f} err/s", link_color))
+      lines.append((f"rec:{us.recoveryCount} inact:{us.ssInactiveCount} det:{us.rxDetectCount}", COLORS.WHITE_TRANSLUCENT))
+      lines.append((f"disc:{us.disconnectCount} vbus:{us.vbusMv}", COLORS.WHITE_TRANSLUCENT))
 
-    fs = FONT_SIZES.model_source
-    pad, gap = 12, 4
-    s1 = measure_text_cached(self._font_bold, egpu_text, fs)
-    s2 = measure_text_cached(self._font_bold, model_text, fs)
-    s3 = measure_text_cached(self._font_bold, peak_text, fs)
-    s4 = measure_text_cached(self._font_bold, drop_text, fs)
-    box_w = max(s1.x, s2.x, s3.x, s4.x) + 2 * pad
-    box_h = s1.y + s2.y + s3.y + s4.y + 3 * gap + 2 * pad
+    fs = FONT_SIZES.model_source * 0.7  # smaller
+    pad, gap = 10, 3
+    sizes = [measure_text_cached(self._font_bold, t, fs) for t, _ in lines]
+    # fixed width from a worst-case reference string so the box doesn't jitter/recenter as values change
+    box_w = measure_text_cached(self._font_bold, "usb link: poweredOff  9999 err/s", fs).x + 2 * pad
+    box_h = sum(s.y for s in sizes) + (len(lines) - 1) * gap + 2 * pad
     box_x = rect.x + rect.width / 2 - box_w / 2
     box_y = rect.y + 12
     rl.draw_rectangle_rounded(rl.Rectangle(box_x, box_y, box_w, box_h), 0.2, 10, COLORS.BLACK_TRANSLUCENT)
-    rl.draw_text_ex(self._font_bold, egpu_text, rl.Vector2(box_x + pad, box_y + pad), fs, 0, egpu_color)
-    rl.draw_text_ex(self._font_bold, model_text, rl.Vector2(box_x + pad, box_y + pad + s1.y + gap), fs, 0, model_color)
-    rl.draw_text_ex(self._font_bold, peak_text, rl.Vector2(box_x + pad, box_y + pad + s1.y + gap + s2.y + gap), fs, 0, info_color)
-    rl.draw_text_ex(self._font_bold, drop_text, rl.Vector2(box_x + pad, box_y + pad + s1.y + gap + s2.y + gap + s3.y + gap), fs, 0, info_color)
+    y = box_y + pad
+    for (text, color), s in zip(lines, sizes):
+      rl.draw_text_ex(self._font_bold, text, rl.Vector2(box_x + pad, y), fs, 0, color)
+      y += s.y + gap
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel
