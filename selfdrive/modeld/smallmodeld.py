@@ -8,7 +8,7 @@ def main(demo=False):
   # core 7, shared with the big model but at slightly lower priority (52 vs 53) so big stays fast.
   # small is light (qcom, no usb) and runs in big's eGPU-wait gaps, holding 20Hz.
   try:
-    run(usbgpu=False, channel_path=SMALL_CHANNEL, core=7, priority=52, demo=demo)
+    run(usbgpu=False, channel_path=SMALL_CHANNEL, core=[0,1,2,3], priority=52, demo=demo)
   except Exception:
     cloudlog.exception("smallmodeld crashed")  # the launcher only sends crashes to sentry, log to rlog too
     raise
