@@ -5,8 +5,9 @@ from openpilot.selfdrive.modeld.model_worker import run
 
 
 def main(demo=False):
-  # core 7, shared with the big model but at slightly lower priority (52 vs 53) so big stays fast.
-  # small is light (qcom, no usb) and runs in big's eGPU-wait gaps, holding 20Hz.
+  # little cluster (cores 0-3), separate from big on core 7. small is light (qcom, no usb) and
+  # holds a steady 20Hz here independent of the big model, so a big-model stall on core 7 no
+  # longer starves the small fallback (which was causing modelV2 gaps -> selfdrivedLagging).
   try:
     run(usbgpu=False, channel_path=SMALL_CHANNEL, core=[0,1,2,3], priority=52, demo=demo)
   except Exception:
