@@ -17,7 +17,9 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.modeld import ModelState, FrameMeta, LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS
-from openpilot.selfdrive.modeld.model_channel import ModelChannel
+from openpilot.selfdrive.modeld.model_channel import ModelChannel, SMALL_CHANNEL
+
+BIG_LOAD_RETRY_DELAY_S = 5.0
 
 
 def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
@@ -47,24 +49,43 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
     time.sleep(0.1)
   cloudlog.warning(f"{name} vision connected")
 
-  # big tries the load once. on failure park (exiting trips a "not running" alert); the selector
-  # keeps publishing small and the next ignition retries fresh. a retry loop would hold off the
-  # selector for minutes when the eGPU is dead. small (the pacer) raises on load fail so the
-  # manager restarts it.
-  st = time.monotonic()
-  cloudlog.warning(f"{name} loading model")
-  try:
-    model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
-  except Exception:
-    cloudlog.exception(f"{name} model load failed")
-    if not usbgpu:
-      raise  # small is the pacer, let it crash so the manager restarts it
-    # big load failed. park so the selector keeps publishing small. flag failed so the UI shows
-    # small, not "big: loading"
-    params.put_bool("UsbGpuFailed", True)
+  if usbgpu:
+    cloudlog.warning(f"{name} waiting for smallmodeld before loading")
+    small_channel = None
     while True:
-      time.sleep(1)
-  cloudlog.warning(f"{name} loaded model in {time.monotonic() - st:.1f}s")
+      if small_channel is None:
+        try:
+          small_channel = ModelChannel(SMALL_CHANNEL, create=False)
+        except OSError:
+          time.sleep(0.05)
+          continue
+      if small_channel.peek_frame_id() is not None:
+        break
+      time.sleep(0.05)
+    cloudlog.warning(f"{name} smallmodeld is producing, loading big model")
+
+  load_attempt = 0
+  while True:
+    load_attempt += 1
+    st = time.monotonic()
+    cloudlog.warning(f"{name} loading model (attempt {load_attempt})")
+    try:
+      model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
+      if usbgpu:
+        params.put_bool("UsbGpuFailed", False)
+        params.put_bool("UsbGpuRetrying", False)
+      cloudlog.warning(f"{name} loaded model in {time.monotonic() - st:.1f}s after {load_attempt} attempt(s)")
+      break
+    except Exception:
+      cloudlog.exception(f"{name} model load failed on attempt {load_attempt}")
+      if not usbgpu:
+        raise  # small is the pacer, let it crash so the manager restarts it
+      # Big load failure is not fatal to driving: selector is paced by smallmodeld. Keep this
+      # process alive and keep trying, but make the UI clear that the eGPU model is not usable yet.
+      params.put_bool("UsbGpuActive", False)
+      params.put_bool("UsbGpuFailed", True)
+      params.put_bool("UsbGpuRetrying", True)
+      time.sleep(BIG_LOAD_RETRY_DELAY_S)
 
   sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
   if demo:
@@ -163,7 +184,9 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
       # big errored/disconnected. modeld is already on small with no gap. park instead of exiting
       # (exiting trips "bigmodeld not running") and don't touch the usbgpu again until next ignition.
       # flag failed so the UI shows small, not "big: loading"
+      params.put_bool("UsbGpuActive", False)
       params.put_bool("UsbGpuFailed", True)
+      params.put_bool("UsbGpuRetrying", False)
       while True:
         time.sleep(1)
     model_execution_time = time.perf_counter() - mt1

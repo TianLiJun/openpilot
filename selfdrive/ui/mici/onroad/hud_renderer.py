@@ -38,6 +38,7 @@ class Colors:
   BLACK_TRANSLUCENT = rl.Color(0, 0, 0, 166)
   MODEL_GREEN = rl.Color(128, 216, 166, 255)  # small model
   MODEL_BLUE = rl.Color(96, 165, 235, 255)    # big (eGPU) model
+  MODEL_YELLOW = rl.Color(255, 178, 64, 255)  # degraded but still present
   MODEL_RED = rl.Color(235, 90, 90, 255)      # crashed or not reachable
 
 
@@ -206,10 +207,12 @@ class HudRenderer(Widget):
       sv = (f"{exec_ms:.0f} ms", COLORS.MODEL_GREEN)
     else:
       sv = ("ready", COLORS.WHITE)
-    lines.append([("small model: ", COLORS.WHITE), sv])
+    lines.append([("small: ", COLORS.WHITE), sv])
 
     if not ui_state.usbgpu:
       bv = ("off", COLORS.WHITE)
+    elif ui_state.usbgpu_retrying:
+      bv = ("retrying", COLORS.MODEL_RED)
     elif ui_state.usbgpu_failed or not ui_state.usbgpu_compiled:
       bv = ("failed", COLORS.MODEL_RED)
     elif not ui_state.usbgpu_active:
@@ -218,12 +221,12 @@ class HudRenderer(Widget):
       bv = (f"{exec_ms:.0f} ms", COLORS.MODEL_GREEN)
     else:
       bv = ("ready", COLORS.WHITE)
-    lines.append([("big model: ", COLORS.WHITE), bv])
+    lines.append([("big: ", COLORS.WHITE), bv])
 
     # USB link stability - the counters that matter for a marginal cable
     us = sm["usbState"]
     if not sm.alive["usbState"] or not us.connected or us.speedMbps == 0:  # no SuperSpeed link -> off
-      lines.append([("usb link: off", COLORS.WHITE_TRANSLUCENT)])
+      lines.append([("usb: off", COLORS.WHITE_TRANSLUCENT)])
     else:
       now = time.monotonic()
       self._usb_hist.append((now, us.linkErrorCount))
@@ -235,29 +238,50 @@ class HudRenderer(Widget):
         dc = self._usb_hist[-1][1] - self._usb_hist[0][1]
         rate = dc / dt if dt > 0 and dc >= 0 else 0.0
       ltssm = str(us.ltssmState)
-      disp = "up" if ltssm == "unknown" else ltssm  # connected at SS but usbd didn't classify -> up
       # red if the link is/was unstable (current rate OR any accumulated recoveries/re-detects/disconnects),
       # so an idle-but-marginal link (0 err/s now) still flags instead of looking healthy
       bad = (ltssm not in ("u0", "unknown") or rate >= 20 or
              us.recoveryCount > 0 or us.rxDetectCount > 0 or us.disconnectCount > 0)
-      link_color = COLORS.MODEL_RED if bad else COLORS.MODEL_GREEN
+      if ui_state.usbgpu_retrying:
+        disp = "retrying"
+      elif ltssm not in ("u0", "unknown"):
+        disp = "unstable"
+      elif bad:
+        disp = "degraded"
+      elif ltssm == "unknown":
+        disp = "connected"
+      else:
+        disp = "connected"
+      link_color = COLORS.MODEL_YELLOW if bad else COLORS.MODEL_GREEN
       d2 = lambda v: min(int(v), 99)  # cap counters to 2 digits
-      lines.append([(f"usb link: {disp}   {rate:.0f} err/s", link_color)])
-      lines.append([(f"recoveries: {d2(us.recoveryCount)}   inactive: {d2(us.ssInactiveCount)}", COLORS.WHITE_TRANSLUCENT)])
-      lines.append([(f"re-detect: {d2(us.rxDetectCount)}   disconnects: {d2(us.disconnectCount)}", COLORS.WHITE_TRANSLUCENT)])
-      lines.append([(f"poweredoff: {d2(us.poweredOffCount)}   overcurrent: {d2(us.overCurrentCount)}", COLORS.WHITE_TRANSLUCENT)])
-      lines.append([(f"vbus: {us.vbusMv} mV   speed: {us.speedMbps}", COLORS.WHITE_TRANSLUCENT)])
+      if disp == "retrying":
+        link_color = COLORS.MODEL_RED
+      speed = f"{us.speedMbps // 1000} Gbit/s" if us.speedMbps >= 1000 and us.speedMbps % 1000 == 0 else f"{us.speedMbps} Mbit/s"
+      lines.append([(f"usb: {speed}, {rate:.0f} err/s", link_color)])
+      lines.append([(f"ltssm: {ltssm}", COLORS.WHITE_TRANSLUCENT)])
+      lines.append([(f"evt: rec {d2(us.recoveryCount)}  rx {d2(us.rxDetectCount)}  dc {d2(us.disconnectCount)}", COLORS.WHITE_TRANSLUCENT)])
 
-    fs = FONT_SIZES.model_source * 0.55  # bigger; 2 items/row so it fits the screen width
+    fs = FONT_SIZES.model_source * 1.85
     pad, gap = 8, 3
     sw = lambda t: measure_text_cached(self._font_bold, t, fs)
+    box_x = rect.x + 77
+    box_y = rect.y + 1
+    max_box_w = max(0, rect.x + rect.width - box_x - 8)
+
+    def line_width(segs):
+      return sum(sw(text).x for text, _ in segs)
+
+    refs = ["big: retrying", "usb: 5 Gbit/s, 999 err/s", "ltssm: ssDisabled", "evt: rec 99  rx 99  dc 99"]
+    max_line_w = max(max(line_width(line) for line in lines), max(sw(r).x for r in refs))
+    max_content_w = max(1, max_box_w - 2 * pad)
+    if max_line_w > max_content_w:
+      fs = max(34, fs * max_content_w / max_line_w)
+      sw = lambda t: measure_text_cached(self._font_bold, t, fs)
+
     line_h = sw("Ag").y
-    # fixed width from a worst-case 2-item row so the box doesn't jitter/recenter as values change
-    refs = ["recoveries: 99   inactive: 99", "disconnects: 99   poweredoff: 99", "overcurrent: 99   re-detect: 99"]
-    box_w = max(sw(r).x for r in refs) + 2 * pad
+    # fixed width from worst-case rows so the box doesn't jitter as values change
+    box_w = min(max(max(line_width(line) for line in lines), max(sw(r).x for r in refs)) + 2 * pad, max_box_w)
     box_h = len(lines) * line_h + (len(lines) - 1) * gap + 2 * pad
-    box_x = rect.x + 20
-    box_y = rect.y + 12
     rl.draw_rectangle_rounded(rl.Rectangle(box_x, box_y, box_w, box_h), 0.2, 10, COLORS.BLACK_TRANSLUCENT)
     y = box_y + pad
     for segs in lines:
