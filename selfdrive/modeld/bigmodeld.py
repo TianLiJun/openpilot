@@ -10,6 +10,7 @@ os.environ.setdefault("HCQ_NUM_SDMA", "1")
 os.environ.setdefault("XDG_CACHE_HOME", "/data/.cache")
 os.environ.setdefault("CACHEDB", "/data/.cache/tinygrad/cache.db")
 os.environ.setdefault("TMPDIR", "/data/tmp")
+os.environ.setdefault("USBGPU_RETRAIN", "0")
 
 import time
 from openpilot.common.swaglog import cloudlog
@@ -47,7 +48,7 @@ def main(demo=False):
       except Exception:
         cloudlog.exception("bigmodeld failed to update USB GPU params after retrain failure")
       cloudlog.warning(f"bigmodeld delaying model load: USB GPU link retrain failed after {result.time_to_stable_s:.1f}s")
-      time.sleep(float(os.getenv("USBGPU_RETRAIN_RETRY_DELAY", "2")))
+      time.sleep(float(os.getenv("USBGPU_RETRAIN_RETRY_DELAY", "30")))
 
     try:
       params.put_bool("UsbGpuFailed", False)

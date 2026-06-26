@@ -22,10 +22,51 @@ from openpilot.selfdrive.modeld.model_channel import ModelChannel, SMALL_CHANNEL
 
 BIG_LOAD_RETRY_DELAY_S = 5.0
 USB_PORTLI_PATH = Path("/sys/devices/platform/soc/a600000.ssusb/portli")
+USBGPU_PREWARM = os.getenv("USBGPU_PREWARM", "1") != "0"
+USBGPU_SYNTHETIC_WARMUP = os.getenv("USBGPU_SYNTHETIC_WARMUP", "1") != "0"
 
 
 class UsbGpuNeedsReload(Exception):
   pass
+
+
+class SyntheticVisionBuf:
+  def __init__(self, size: int):
+    self.data = bytearray(size)
+
+
+def synthetic_warm_model(name: str, model: ModelState) -> None:
+  bufs = {n: SyntheticVisionBuf(model.frame_buf_params[n][3]) for n in model.vision_input_names}
+  transforms = {n: np.eye(3, dtype=np.float32) for n in model.vision_input_names}
+  inputs = {
+    'desire_pulse': np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32),
+    'traffic_convention': np.array([1.0, 0.0], dtype=np.float32),
+    'action_t': np.zeros(2, dtype=np.float32),
+  }
+  st = time.monotonic()
+  model.run(bufs, transforms, inputs, False)
+  cloudlog.warning(f"{name} synthetic warmup completed in {time.monotonic() - st:.1f}s at {model.cam_w}x{model.cam_h}")
+
+
+def connect_vision_clients(name: str):
+  cloudlog.warning(f"{name} waiting for camerad vision")
+  while True:
+    available_streams = VisionIpcClient.available_streams("camerad", block=False)
+    if available_streams:
+      use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_ROAD in available_streams
+      main_wide_camera = VisionStreamType.VISION_STREAM_ROAD not in available_streams
+      break
+    time.sleep(.1)
+
+  vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_ROAD
+  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
+  vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
+  while not vipc_client_main.connect(False):
+    time.sleep(0.1)
+  while use_extra_client and not vipc_client_extra.connect(False):
+    time.sleep(0.1)
+  cloudlog.warning(f"{name} vision connected: main={vipc_client_main.width}x{vipc_client_main.height} extra={use_extra_client}")
+  return use_extra_client, main_wide_camera, vipc_client_main, vipc_client_extra
 
 
 def read_usb_portli() -> int | None:
@@ -57,44 +98,30 @@ def safe_put_bool(params: Params, key: str, value: bool) -> None:
 def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
   name = "bigmodeld" if usbgpu else "smallmodeld"
   cloudlog.warning(f"{name} init")
-  # big loads and warms up at low priority so its multi-second first-run jit compile never starves the
-  # small model sharing core 7. it is raised to full priority after that first run finishes (see below).
-  config_realtime_process(core, 1 if usbgpu else priority)
+  # Big is isolated on core 7 while small runs on cores 0-3, so let big load/warm at full priority.
+  # Keeping this configurable makes it easy to back off if a platform shows startup contention.
+  load_priority = int(os.getenv("USBGPU_LOAD_PRIORITY", str(priority))) if usbgpu else priority
+  config_realtime_process(core, load_priority)
   params = Params()
   channel = ModelChannel(channel_path, create=True)
 
-  cloudlog.warning(f"{name} waiting for camerad vision")
-  while True:
-    available_streams = VisionIpcClient.available_streams("camerad", block=False)
-    if available_streams:
-      use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_ROAD in available_streams
-      main_wide_camera = VisionStreamType.VISION_STREAM_ROAD not in available_streams
-      break
-    time.sleep(.1)
+  model = None
+  if usbgpu and USBGPU_PREWARM:
+    st = time.monotonic()
+    load_portli = read_usb_portli()
+    try:
+      cloudlog.warning(f"{name} prewarming model before camerad")
+      model = ModelState(None, None, True)
+      log_usb_portli_rate(name, "prewarm_model_load", load_portli, st)
+      if USBGPU_SYNTHETIC_WARMUP:
+        synthetic_warm_model(name, model)
+      safe_put_bool(params, "UsbGpuFailed", False)
+    except Exception:
+      log_usb_portli_rate(name, "prewarm_failed", load_portli, st)
+      cloudlog.exception(f"{name} prewarm failed, falling back to onroad load")
+      model = None
 
-  vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_ROAD
-  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
-  vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
-  while not vipc_client_main.connect(False):
-    time.sleep(0.1)
-  while use_extra_client and not vipc_client_extra.connect(False):
-    time.sleep(0.1)
-  cloudlog.warning(f"{name} vision connected")
-
-  if usbgpu:
-    cloudlog.warning(f"{name} waiting for smallmodeld before loading")
-    small_channel = None
-    while True:
-      if small_channel is None:
-        try:
-          small_channel = ModelChannel(SMALL_CHANNEL, create=False)
-        except OSError:
-          time.sleep(0.05)
-          continue
-      if small_channel.peek_frame_id() is not None:
-        break
-      time.sleep(0.05)
-    cloudlog.warning(f"{name} smallmodeld is producing, loading big model")
+  use_extra_client, main_wide_camera, vipc_client_main, vipc_client_extra = connect_vision_clients(name)
 
   load_attempt = 0
   while True:
@@ -103,7 +130,8 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
     load_portli = read_usb_portli() if usbgpu else None
     cloudlog.warning(f"{name} loading model (attempt {load_attempt})")
     try:
-      model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
+      if model is None or model.cam_w != vipc_client_main.width or model.cam_h != vipc_client_main.height:
+        model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
       if usbgpu:
         log_usb_portli_rate(name, "model_load", load_portli, st)
       if usbgpu:
@@ -146,6 +174,7 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
   warmup_start_t = time.monotonic()
   steady_portli = warmup_portli
   steady_start_t = warmup_start_t
+  no_frame_start_t = None
 
   while True:
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
@@ -156,10 +185,23 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
     if buf_main is None:
       # no frame from camerad. if this persists the camera pipeline is wedged, which stalls both models
       now = time.monotonic()
+      if no_frame_start_t is None:
+        no_frame_start_t = now
       if now - last_frame_log > 2.0:
         cloudlog.warning(f"{name} no camera frame from camerad, waiting")
         last_frame_log = now
+      if usbgpu and now - no_frame_start_t > 2.0:
+        cloudlog.warning(f"{name} reconnecting camerad vision after {now - no_frame_start_t:.1f}s without frames")
+        use_extra_client, main_wide_camera, vipc_client_main, vipc_client_extra = connect_vision_clients(name)
+        if model.cam_w != vipc_client_main.width or model.cam_h != vipc_client_main.height:
+          cloudlog.warning(f"{name} camera dimensions changed, reloading model")
+          model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
+        meta_main = FrameMeta()
+        meta_extra = FrameMeta()
+        last_vipc_frame_id = 0
+        no_frame_start_t = None
       continue
+    no_frame_start_t = None
 
     if use_extra_client:
       while True:

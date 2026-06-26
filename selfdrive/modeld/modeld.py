@@ -72,11 +72,15 @@ class FrameMeta:
 class ModelState:
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
 
-  def __init__(self, cam_w: int, cam_h: int, usbgpu: bool):
+  def __init__(self, cam_w: int | None, cam_h: int | None, usbgpu: bool):
     input_devices = get_tg_input_devices(PROCESS_NAME, usbgpu)
     self.WARP_DEV, self.QUEUE_DEV = input_devices['WARP_DEV'], input_devices['QUEUE_DEV']
     jits = pickle.loads(read_file_chunked(modeld_pkl_path(usbgpu)))
     metadata = jits['metadata']
+    resolution_keys = [k for k in jits.keys() if isinstance(k, tuple)]
+    if cam_w is None or cam_h is None:
+      cam_w, cam_h = min(resolution_keys, key=lambda k: k[0] * k[1])
+    self.cam_w, self.cam_h = cam_w, cam_h
     self.input_shapes = metadata['input_shapes']
     self.vision_input_names = [k for k in self.input_shapes if 'img' in k]
     self.output_slices = metadata['output_slices']
