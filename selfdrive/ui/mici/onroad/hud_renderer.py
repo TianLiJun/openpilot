@@ -226,7 +226,7 @@ class HudRenderer(Widget):
 
     # USB link stability - the counters that matter for a marginal cable
     us = sm["usbState"]
-    if not sm.alive["usbState"] or not us.connected:
+    if not sm.alive["usbState"] or not us.connected or us.speedMbps == 0:  # no SuperSpeed link -> off
       lines.append([("usb: off", COLORS.WHITE_TRANSLUCENT)])
     else:
       now = time.monotonic()

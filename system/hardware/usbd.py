@@ -15,11 +15,8 @@ PUB_DIV = POLL_HZ // PUB_HZ
 HIST_LEN = 24          # ~240ms of LTSSM per publish
 HEALTH_LOG_S = 5       # throttle for the link-health event
 
-SS_DEVICE = "/sys/bus/usb/devices/4-1"  # aux USB (eGPU) when SuperSpeed
-DEVICE = SS_DEVICE
+DEVICE = "/sys/bus/usb/devices/4-1"  # aux USB (eGPU)
 PORT = "/sys/bus/usb/devices/usb4/4-0:1.0/usb4-port1"
-USBGPU_VID = "add1"
-USBGPU_PID = "0001"
 
 # xHCI PORTSC Port Link State (bits 8:5) -> cereal LtssmState
 PLS = ["u0", "u1", "u2", "u3", "ssDisabled", "rxDetect", "ssInactive", "poll",
@@ -41,13 +38,6 @@ def read(attr: str, base: str = DEVICE) -> str | None:
       return f.read().strip()
   except OSError:
     return None
-
-
-def find_usbgpu_device() -> str:
-  for d in sorted(glob.glob("/sys/bus/usb/devices/*-*")):
-    if read("idVendor", d) == USBGPU_VID and read("idProduct", d) == USBGPU_PID:
-      return d
-  return SS_DEVICE
 
 
 def read_int(path: str, default: int = 0) -> int:
@@ -72,7 +62,7 @@ def over_current_count() -> int:
 
 def find_controller() -> str | None:
   """Resolve the dwc3-msm (.ssusb) node exposing the host SS-port registers"""
-  m = re.search(r"([0-9a-f]+\.ssusb)", os.path.realpath(SS_DEVICE))
+  m = re.search(r"([0-9a-f]+\.ssusb)", os.path.realpath(DEVICE))
   if m:
     cand = f"/sys/bus/platform/devices/{m.group(1)}"
     if os.path.exists(os.path.join(cand, "portsc")):
@@ -110,9 +100,8 @@ def main():
   health_link_err = health_rec = health_ss = health_rx = 0
 
   while True:
-    device = find_usbgpu_device()
     # registers are only safe to read while the controller is powered/active
-    pm_active = read("power/runtime_status", SS_DEVICE) == "active"
+    pm_active = read("power/runtime_status") == "active"
 
     if ctrl is not None:
       if pm_active:
@@ -130,7 +119,7 @@ def main():
         prev_ltssm = ltssm
 
     if tick % PUB_DIV == 0:
-      speed = read("speed", device)
+      speed = read("speed")
       connected = speed is not None
       speed_mbps = int(speed) if (speed and speed.isdigit()) else 0
 
@@ -139,7 +128,7 @@ def main():
         disconnect_count += 1
         cloudlog.event("usb_disconnected", count=disconnect_count, lastNonU0=last_non_u0)
       elif connected and not was_connected:
-        cloudlog.event("usb_connected", idVendor=read("idVendor", device), idProduct=read("idProduct", device), speed=speed)
+        cloudlog.event("usb_connected", idVendor=read("idVendor"), idProduct=read("idProduct"), speed=speed)
       was_connected = connected
 
       if ctrl is not None and pm_active:
@@ -167,9 +156,9 @@ def main():
       s.linkErrorCount = link_error_count
 
       # sleep / power states
-      s.runtimeSuspendedMs = read_int(os.path.join(device, "power/runtime_suspended_time"))
-      s.lpmU1Enabled = read("power/usb3_hardware_lpm_u1", device) == "enabled"
-      s.lpmU2Enabled = read("power/usb3_hardware_lpm_u2", device) == "enabled"
+      s.runtimeSuspendedMs = read_int(os.path.join(DEVICE, "power/runtime_suspended_time"))
+      s.lpmU1Enabled = read("power/usb3_hardware_lpm_u1") == "enabled"
+      s.lpmU2Enabled = read("power/usb3_hardware_lpm_u2") == "enabled"
 
       # VBUS brownout discriminator
       s.vbusMv = read_vbus_mv()
