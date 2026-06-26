@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 import os
+
+os.environ.setdefault("DEV", "USB+AMD:LLVM")
+os.environ.setdefault("WARP_DEV", "QCOM")
+os.environ.setdefault("FLOAT16", "1")
+os.environ.setdefault("JIT_BATCH_SIZE", "0")
+os.environ.setdefault("GMMU", "0")
+os.environ.setdefault("HCQ_NUM_SDMA", "1")
+os.environ.setdefault("XDG_CACHE_HOME", "/data/.cache")
+os.environ.setdefault("CACHEDB", "/data/.cache/tinygrad/cache.db")
+os.environ.setdefault("TMPDIR", "/data/tmp")
+
 import time
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, modeld_pkl_path
