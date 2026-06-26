@@ -26,8 +26,8 @@ from openpilot.selfdrive.modeld.helpers import modeld_pkl_path
 BIG_LOAD_RETRY_DELAY_S = 5.0
 USB_PORTLI_PATH = Path("/sys/devices/platform/soc/a600000.ssusb/portli")
 USBGPU_MODEL_LOAD_METRICS = Path("/data/tmp/usbgpu_model_load_metrics.json")
-USBGPU_PREWARM = os.getenv("USBGPU_PREWARM", "1") != "0"
-USBGPU_SYNTHETIC_WARMUP = os.getenv("USBGPU_SYNTHETIC_WARMUP", "1") != "0"
+USBGPU_PREWARM = os.getenv("USBGPU_PREWARM", "0") == "1"
+USBGPU_SYNTHETIC_WARMUP = os.getenv("USBGPU_SYNTHETIC_WARMUP", "0") == "1"
 
 
 class UsbGpuNeedsReload(Exception):
