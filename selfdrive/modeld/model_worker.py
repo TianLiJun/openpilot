@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 os.environ['GMMU'] = '0'  # for usbgpu fast loading, noop for qcom
+import json
 import time
 from pathlib import Path
 import numpy as np
@@ -9,6 +10,7 @@ from cereal import car, log
 from cereal.messaging import SubMaster
 from msgq.visionipc import VisionIpcClient, VisionStreamType
 from opendbc.car.car_helpers import get_demo_car_params
+from openpilot.common.file_chunker import get_existing_chunks
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -19,9 +21,11 @@ from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.modeld import ModelState, FrameMeta, LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS
 from openpilot.selfdrive.modeld.model_channel import ModelChannel, SMALL_CHANNEL
+from openpilot.selfdrive.modeld.helpers import modeld_pkl_path
 
 BIG_LOAD_RETRY_DELAY_S = 5.0
 USB_PORTLI_PATH = Path("/sys/devices/platform/soc/a600000.ssusb/portli")
+USBGPU_MODEL_LOAD_METRICS = Path("/data/tmp/usbgpu_model_load_metrics.json")
 USBGPU_PREWARM = os.getenv("USBGPU_PREWARM", "1") != "0"
 USBGPU_SYNTHETIC_WARMUP = os.getenv("USBGPU_SYNTHETIC_WARMUP", "1") != "0"
 
@@ -88,6 +92,28 @@ def log_usb_portli_rate(name: str, stage: str, start: int | None, start_t: float
   return end
 
 
+def chunked_file_size(path: Path) -> int | None:
+  try:
+    return sum(Path(p).stat().st_size for p in get_existing_chunks(path))
+  except Exception:
+    return None
+
+
+def write_usbgpu_load_metrics(model_bytes: int, load_s: float) -> None:
+  try:
+    USBGPU_MODEL_LOAD_METRICS.parent.mkdir(parents=True, exist_ok=True)
+    USBGPU_MODEL_LOAD_METRICS.write_text(json.dumps({
+      "bytes": model_bytes,
+      "mib": model_bytes / (1024 * 1024),
+      "seconds": load_s,
+      "mibps": model_bytes / (1024 * 1024) / max(load_s, 0.001),
+      "monotonic": time.monotonic(),
+      "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }, sort_keys=True) + "\n")
+  except Exception:
+    cloudlog.exception("failed to write USB GPU model load metrics")
+
+
 def safe_put_bool(params: Params, key: str, value: bool) -> None:
   try:
     params.put_bool(key, value)
@@ -110,8 +136,16 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
     st = time.monotonic()
     load_portli = read_usb_portli()
     try:
+      model_bytes = chunked_file_size(modeld_pkl_path(True))
       cloudlog.warning(f"{name} prewarming model before camerad")
       model = ModelState(None, None, True)
+      load_s = time.monotonic() - st
+      if model_bytes is not None:
+        write_usbgpu_load_metrics(model_bytes, load_s)
+        cloudlog.warning(
+          f"{name} prewarm model load throughput: bytes={model_bytes} MiB={model_bytes / (1024 * 1024):.1f} "
+          f"seconds={load_s:.2f} MiBps={model_bytes / (1024 * 1024) / max(load_s, 0.001):.2f}"
+        )
       log_usb_portli_rate(name, "prewarm_model_load", load_portli, st)
       if USBGPU_SYNTHETIC_WARMUP:
         synthetic_warm_model(name, model)
@@ -130,13 +164,21 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
     load_portli = read_usb_portli() if usbgpu else None
     cloudlog.warning(f"{name} loading model (attempt {load_attempt})")
     try:
+      model_bytes = chunked_file_size(modeld_pkl_path(usbgpu)) if usbgpu else None
       if model is None or model.cam_w != vipc_client_main.width or model.cam_h != vipc_client_main.height:
         model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
+      load_s = time.monotonic() - st
+      if usbgpu and model_bytes is not None:
+        write_usbgpu_load_metrics(model_bytes, load_s)
+        cloudlog.warning(
+          f"{name} model load throughput: bytes={model_bytes} MiB={model_bytes / (1024 * 1024):.1f} "
+          f"seconds={load_s:.2f} MiBps={model_bytes / (1024 * 1024) / max(load_s, 0.001):.2f}"
+        )
       if usbgpu:
         log_usb_portli_rate(name, "model_load", load_portli, st)
       if usbgpu:
         safe_put_bool(params, "UsbGpuFailed", False)
-      cloudlog.warning(f"{name} loaded model in {time.monotonic() - st:.1f}s after {load_attempt} attempt(s)")
+      cloudlog.warning(f"{name} loaded model in {load_s:.1f}s after {load_attempt} attempt(s)")
       break
     except Exception:
       if usbgpu:
