@@ -13,13 +13,15 @@ os.environ.setdefault("TMPDIR", "/data/tmp")
 
 import time
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.params import Params
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, modeld_pkl_path
 from openpilot.common.file_chunker import get_manifest_path
 from openpilot.selfdrive.modeld.model_channel import BIG_CHANNEL
-from openpilot.selfdrive.modeld.model_worker import run
+from openpilot.selfdrive.modeld.usbgpu_retrain import calibrate_usb_gpu_link_result
 
 
 def main(demo=False):
+  params = Params()
   present = usbgpu_present()
   compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
   if not (present and compiled):
@@ -28,9 +30,30 @@ def main(demo=False):
     cloudlog.warning(f"bigmodeld idling, no big model (usbgpu_present={present} compiled={compiled})")
     while True:
       time.sleep(1)
-  # core 7, shared with the small model. big loads and warms up at low priority so it never starves
-  # small, then runs at higher priority than small (53 vs 52) once warm (see model_worker).
+  while True:
+    result = calibrate_usb_gpu_link_result(
+      attempts=int(os.getenv("USBGPU_RETRAIN_ATTEMPTS", "1")),
+      threshold=float(os.getenv("USBGPU_RETRAIN_THRESHOLD", "10")),
+      quick_seconds=float(os.getenv("USBGPU_RETRAIN_QUICK_SECONDS", "5")),
+      confirm_seconds=float(os.getenv("USBGPU_RETRAIN_CONFIRM_SECONDS", "0")),
+      cloudlog=cloudlog,
+    )
+    if result.passed:
+      break
+    try:
+      params.put_bool("UsbGpuActive", False)
+      params.put_bool("UsbGpuFailed", True)
+    except Exception:
+      cloudlog.exception("bigmodeld failed to update USB GPU params after retrain failure")
+    cloudlog.warning(f"bigmodeld delaying model load: USB GPU link retrain failed after {result.time_to_stable_s:.1f}s")
+    time.sleep(float(os.getenv("USBGPU_RETRAIN_RETRY_DELAY", "2")))
+
   try:
+    params.put_bool("UsbGpuFailed", False)
+  except Exception:
+    cloudlog.exception("bigmodeld failed to update USB GPU params after retrain pass")
+  try:
+    from openpilot.selfdrive.modeld.model_worker import run
     run(usbgpu=True, channel_path=BIG_CHANNEL, core=7, priority=53, demo=demo)
   except Exception:
     # any crash before the worker's own model-load/run guards (eg vision/setup phase) must not exit:

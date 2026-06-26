@@ -169,7 +169,6 @@ def main(demo=False):
   params.put_bool("UsbGpuCompiled", _compiled)
   params.put_bool("UsbGpuActive", False)
   params.put_bool("UsbGpuFailed", False)
-  params.put_bool("UsbGpuRetrying", False)
 
   config_realtime_process([0, 1, 2, 3], 54)  # selector is light, core 7 is reserved for the big model
 

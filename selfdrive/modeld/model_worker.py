@@ -2,6 +2,7 @@
 import os
 os.environ['GMMU'] = '0'  # for usbgpu fast loading, noop for qcom
 import time
+from pathlib import Path
 import numpy as np
 import cereal.messaging as messaging
 from cereal import car, log
@@ -20,6 +21,33 @@ from openpilot.selfdrive.modeld.modeld import ModelState, FrameMeta, LAT_SMOOTH_
 from openpilot.selfdrive.modeld.model_channel import ModelChannel, SMALL_CHANNEL
 
 BIG_LOAD_RETRY_DELAY_S = 5.0
+USB_PORTLI_PATH = Path("/sys/devices/platform/soc/a600000.ssusb/portli")
+
+
+def read_usb_portli() -> int | None:
+  try:
+    return int(USB_PORTLI_PATH.read_text().strip(), 16)
+  except Exception:
+    return None
+
+
+def log_usb_portli_rate(name: str, stage: str, start: int | None, start_t: float, end: int | None = None) -> int | None:
+  if start is None:
+    return end
+  end = read_usb_portli() if end is None else end
+  if end is None:
+    return None
+  dt = max(time.monotonic() - start_t, 0.001)
+  delta = end - start if end >= start else end
+  cloudlog.warning(f"{name} USB link {stage}: portli=0x{start:08x}->0x{end:08x} delta={delta} seconds={dt:.1f} err_per_s={delta / dt:.2f}")
+  return end
+
+
+def safe_put_bool(params: Params, key: str, value: bool) -> None:
+  try:
+    params.put_bool(key, value)
+  except Exception:
+    cloudlog.exception(f"failed to write param {key}")
 
 
 def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
@@ -68,23 +96,26 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
   while True:
     load_attempt += 1
     st = time.monotonic()
+    load_portli = read_usb_portli() if usbgpu else None
     cloudlog.warning(f"{name} loading model (attempt {load_attempt})")
     try:
       model = ModelState(vipc_client_main.width, vipc_client_main.height, usbgpu)
       if usbgpu:
-        params.put_bool("UsbGpuFailed", False)
-        params.put_bool("UsbGpuRetrying", False)
+        log_usb_portli_rate(name, "model_load", load_portli, st)
+      if usbgpu:
+        safe_put_bool(params, "UsbGpuFailed", False)
       cloudlog.warning(f"{name} loaded model in {time.monotonic() - st:.1f}s after {load_attempt} attempt(s)")
       break
     except Exception:
+      if usbgpu:
+        log_usb_portli_rate(name, "model_load_failed", load_portli, st)
       cloudlog.exception(f"{name} model load failed on attempt {load_attempt}")
       if not usbgpu:
         raise  # small is the pacer, let it crash so the manager restarts it
       # Big load failure is not fatal to driving: selector is paced by smallmodeld. Keep this
       # process alive and keep trying, but make the UI clear that the eGPU model is not usable yet.
-      params.put_bool("UsbGpuActive", False)
-      params.put_bool("UsbGpuFailed", True)
-      params.put_bool("UsbGpuRetrying", True)
+      safe_put_bool(params, "UsbGpuActive", False)
+      safe_put_bool(params, "UsbGpuFailed", True)
       time.sleep(BIG_LOAD_RETRY_DELAY_S)
 
   sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
@@ -107,6 +138,10 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
   produced_count = 0
   big_warmed = False
   last_frame_log = 0.0
+  warmup_portli = read_usb_portli() if usbgpu else None
+  warmup_start_t = time.monotonic()
+  steady_portli = warmup_portli
+  steady_start_t = warmup_start_t
 
   while True:
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
@@ -184,14 +219,15 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
       # big errored/disconnected. modeld is already on small with no gap. park instead of exiting
       # (exiting trips "bigmodeld not running") and don't touch the usbgpu again until next ignition.
       # flag failed so the UI shows small, not "big: loading"
-      params.put_bool("UsbGpuActive", False)
-      params.put_bool("UsbGpuFailed", True)
-      params.put_bool("UsbGpuRetrying", False)
+      safe_put_bool(params, "UsbGpuActive", False)
+      safe_put_bool(params, "UsbGpuFailed", True)
       while True:
         time.sleep(1)
     model_execution_time = time.perf_counter() - mt1
     if model_output is not None:
       if usbgpu and not big_warmed:
+        steady_portli = log_usb_portli_rate(name, "first_run", warmup_portli, warmup_start_t)
+        steady_start_t = time.monotonic()
         # the first full run compiled the tinygrad kernels at low priority so small stayed protected.
         # big is warm now, so take full priority and lead on core 7.
         config_realtime_process(core, priority)
@@ -222,4 +258,7 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
       if produced_count == 1 or produced_count % 100 == 0:
         msg = f"{name} producing: frame={meta_main.frame_id} exec={model_execution_time * 1e3:.0f}ms"
         cloudlog.warning(f"{msg} dropped={vipc_dropped_frames} count={produced_count}")
+        if usbgpu and produced_count % 100 == 0:
+          steady_portli = log_usb_portli_rate(name, "steady_100_frames", steady_portli, steady_start_t)
+          steady_start_t = time.monotonic()
     last_vipc_frame_id = meta_main.frame_id
