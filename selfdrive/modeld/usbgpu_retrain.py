@@ -18,6 +18,7 @@ POWER_PATHS = (
 )
 DEFAULT_LOG_PATH = Path("/data/tmp/usb_retrain_search_v2.tsv")
 DEFAULT_SNAPSHOT_PATH = Path("/data/tmp/usb_golden_snapshot.txt")
+USBGPU_PATH = Path("/sys/bus/usb/devices/4-1")
 HARD_DMESG_PATTERNS = (
   "error -71",
   "device descriptor",
@@ -95,6 +96,54 @@ def _set_power_on() -> None:
       path.write_text("on")
     except Exception:
       pass
+
+
+def _read_text(path: Path) -> str | None:
+  try:
+    return path.read_text().strip()
+  except Exception:
+    return None
+
+
+def _superspeed_device_ready() -> bool:
+  return (
+    _read_text(USBGPU_PATH / "idVendor") == "add1" and
+    _read_text(USBGPU_PATH / "idProduct") == "0001" and
+    _read_text(USBGPU_PATH / "speed") == "5000" and
+    _read_text(USBGPU_PATH / "bConfigurationValue") == "1"
+  )
+
+
+def _wait_for_quiet_superspeed(settle_seconds: float, timeout: float, threshold: float, cloudlog=None) -> RetrainResult | None:
+  if settle_seconds <= 0 or timeout <= 0:
+    return None
+
+  start_time = time.monotonic()
+  last_reason = "not checked"
+  while time.monotonic() - start_time < timeout:
+    if not _superspeed_device_ready():
+      last_reason = "USB GPU not configured at SuperSpeed"
+      time.sleep(1.0)
+      continue
+
+    try:
+      sample = _measure(settle_seconds)
+    except Exception as e:
+      last_reason = f"sample failed: {e}"
+      time.sleep(1.0)
+      continue
+
+    elapsed = time.monotonic() - start_time
+    if _sample_ok(sample, threshold):
+      _log(cloudlog, f"usbgpu quiet SuperSpeed settle passed: {sample.err_per_s:.2f} err/s over {settle_seconds:.1f}s elapsed={elapsed:.1f}s")
+      return RetrainResult(True, 0, elapsed, sample.err_per_s)
+
+    last_reason = f"{sample.err_per_s:.2f} err/s hard={sample.hard_errors} resets={sample.resets}"
+    _log(cloudlog, f"usbgpu quiet SuperSpeed settle not ready: {last_reason}")
+    time.sleep(1.0)
+
+  _log(cloudlog, f"usbgpu quiet SuperSpeed settle failed after {timeout:.1f}s: {last_reason}")
+  return RetrainResult(False, 0, timeout, None)
 
 
 def _usb_vendor_pcie_power_cycle(off_delay: float, on_delay: float) -> None:
@@ -191,6 +240,15 @@ def calibrate_usb_gpu_link_result(attempts: int = 8, threshold: float = 10.0, qu
   _set_power_on()
   start_time = time.monotonic()
   _log(cloudlog, f"usbgpu retrain start: attempts={attempts} threshold={threshold:.1f} err/s")
+
+  settle = _wait_for_quiet_superspeed(
+    settle_seconds=float(os.getenv("USBGPU_SETTLE_SECONDS", "8")),
+    timeout=float(os.getenv("USBGPU_SETTLE_TIMEOUT", "30")),
+    threshold=float(os.getenv("USBGPU_SETTLE_THRESHOLD", str(threshold))),
+    cloudlog=cloudlog,
+  )
+  if settle is not None and (settle.passed or os.getenv("USBGPU_RETRAIN_AFTER_SETTLE_FAIL", "0") == "0"):
+    return settle
 
   for attempt in range(1, attempts + 1):
     off_delay, on_delay = delay_pairs[(attempt - 1) % len(delay_pairs)]
