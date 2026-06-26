@@ -237,18 +237,18 @@ def main(demo=False):
       if got is not None and got[0] == target:
         payload = got[1]
 
-    # latched source: require big to deliver BIG_STABLE_FRAMES consecutive frames before switching to
+    # Latched source: require big to deliver BIG_STABLE_FRAMES consecutive frames before switching to
     # it, so a flaky or stale big (e.g. a stale shm frame matching once after a hotplug) doesn't get
-    # latched. once latched, stay on big. if big really goes down mid-drive, fall back to small and
-    # latch big_done for the rest of the ignition (a 10s reload while driving is unacceptable, so we
-    # do not retry mid-drive; big retries only on the initial load, see model_worker). next ignition
-    # starts fresh.
+    # latched. Once latched, stay on big. If big really goes down while engaged, fall back to small
+    # and latch big_done for the rest of the ignition. When not engaged, keep probing big so hotplug
+    # recovery can return to the eGPU without a reboot.
     if used_big:
       big_miss = 0
       if not big_active:
         big_stable_count += 1
         if big_stable_count >= BIG_STABLE_FRAMES:
           big_active = True
+          params.put_bool("UsbGpuFailed", False)
           params.put_bool("UsbGpuActive", True)
           cloudlog.warning(f"modeld switched to BIG model at frame {target}")
       else:
@@ -259,10 +259,13 @@ def main(demo=False):
         big_miss += 1
         if big_miss >= 10:  # ~0.5s of big not delivering = it went down, park until next ignition
           big_active = False
-          big_done = True
           params.put_bool("UsbGpuActive", False)
           params.put_bool("UsbGpuFailed", True)
-          cloudlog.warning(f"modeld big model stalled, staying on small until next ignition (frame {target})")
+          if params.get_bool("IsEngaged"):
+            big_done = True
+            cloudlog.warning(f"modeld big model stalled while engaged, staying on small until next ignition (frame {target})")
+          else:
+            cloudlog.warning(f"modeld big model stalled while not engaged, waiting for recovery (frame {target})")
 
     if payload is not None:
       # drops from our own published cadence, overriding the worker's value. nonzero only when

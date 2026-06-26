@@ -238,26 +238,15 @@ class HudRenderer(Widget):
         dc = self._usb_hist[-1][1] - self._usb_hist[0][1]
         rate = dc / dt if dt > 0 and dc >= 0 else 0.0
       ltssm = str(us.ltssmState)
-      # red if the link is/was unstable (current rate OR any accumulated recoveries/re-detects/disconnects),
-      # so an idle-but-marginal link (0 err/s now) still flags instead of looking healthy
-      bad = (ltssm not in ("u0", "unknown") or rate >= 20 or
-             us.recoveryCount > 0 or us.rxDetectCount > 0 or us.disconnectCount > 0)
-      if ui_state.usbgpu_retrying:
-        disp = "retrying"
-      elif ltssm not in ("u0", "unknown"):
-        disp = "unstable"
-      elif bad:
-        disp = "degraded"
-      elif ltssm == "unknown":
-        disp = "connected"
-      else:
-        disp = "connected"
-      link_color = COLORS.MODEL_YELLOW if bad else COLORS.MODEL_GREEN
-      d2 = lambda v: min(int(v), 99)  # cap counters to 2 digits
-      if disp == "retrying":
+      if ui_state.usbgpu_retrying or ltssm not in ("u0", "unknown") or rate >= 20:
         link_color = COLORS.MODEL_RED
+      elif rate >= 5:
+        link_color = COLORS.MODEL_YELLOW
+      else:
+        link_color = COLORS.MODEL_GREEN
+      d2 = lambda v: min(int(v), 99)  # cap counters to 2 digits
       speed = f"{us.speedMbps // 1000} Gbit/s" if us.speedMbps >= 1000 and us.speedMbps % 1000 == 0 else f"{us.speedMbps} Mbit/s"
-      lines.append([(f"usb: {speed}, {rate:.0f} err/s", link_color)])
+      lines.append([("usb: ", COLORS.WHITE), (f"{speed}, ", COLORS.WHITE), (f"{rate:.0f} err/s", link_color)])
       lines.append([(f"ltssm: {ltssm}", COLORS.WHITE_TRANSLUCENT)])
       lines.append([(f"evt: rec {d2(us.recoveryCount)}  rx {d2(us.rxDetectCount)}  dc {d2(us.disconnectCount)}", COLORS.WHITE_TRANSLUCENT)])
 

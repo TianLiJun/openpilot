@@ -24,6 +24,10 @@ BIG_LOAD_RETRY_DELAY_S = 5.0
 USB_PORTLI_PATH = Path("/sys/devices/platform/soc/a600000.ssusb/portli")
 
 
+class UsbGpuNeedsReload(Exception):
+  pass
+
+
 def read_usb_portli() -> int | None:
   try:
     return int(USB_PORTLI_PATH.read_text().strip(), 16)
@@ -216,6 +220,11 @@ def run(usbgpu: bool, channel_path: str, core, priority: int = 53, demo=False):
       cloudlog.exception(f"{name} model run failed")
       if not usbgpu:
         raise  # small is the pacer, let it crash so the manager restarts it
+      if not params.get_bool("IsEngaged"):
+        safe_put_bool(params, "UsbGpuActive", False)
+        safe_put_bool(params, "UsbGpuFailed", True)
+        cloudlog.warning(f"{name} failed while not engaged; requesting USB GPU retrain and model reload")
+        raise UsbGpuNeedsReload
       # big errored/disconnected. modeld is already on small with no gap. park instead of exiting
       # (exiting trips "bigmodeld not running") and don't touch the usbgpu again until next ignition.
       # flag failed so the UI shows small, not "big: loading"
