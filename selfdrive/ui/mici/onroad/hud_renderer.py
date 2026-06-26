@@ -188,7 +188,8 @@ class HudRenderer(Widget):
       self._draw_set_speed(rect)
 
     self._draw_steering_wheel(rect)
-    self._draw_model_source(rect)
+    if ui_state.show_usb_debug:
+      self._draw_model_source(rect)
 
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
     """Top-left box: eGPU state, the model actually driving, and the USB link stability counters
