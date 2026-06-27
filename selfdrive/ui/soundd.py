@@ -139,12 +139,15 @@ class Soundd:
     data_out[:frames, 0] = self.get_sound_data(frames)
 
   def update_alert(self, new_alert):
-    # let looping sounds complete instead of cutting off when there is no new alert pending
+    current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame >= len(self.loaded_sounds[self.current_alert])
     if new_alert == AudibleAlert.none and self.current_alert != AudibleAlert.none and sound_list[self.current_alert][1] is None:
-      self.pending_stop = True
+      if current_alert_played_once:
+        self.pending_stop = True
+      else:
+        self.current_alert = AudibleAlert.none
+        self.current_sound_frame = 0
       return
     self.pending_stop = False
-    current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame >= len(self.loaded_sounds[self.current_alert])
     if self.current_alert != new_alert and (new_alert != AudibleAlert.none or current_alert_played_once):
       if new_alert == AudibleAlert.warningImmediate:
         self.ramp_start_volume = self.current_volume
