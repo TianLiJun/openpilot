@@ -217,6 +217,7 @@ def make_run_policy(model_runner, model_metadata, frame_skip):
 
 def compile_jit(jit, make_random_inputs, input_keys, make_queues):
   SEED = 42
+  skip_validate = os.getenv("MODEL_COMPILE_SKIP_VALIDATE", "0") == "1"
   def random_inputs_run(fn, seed, test_val=None, test_buffers=None, expect_match=True):
     input_queues, npy = make_queues(Device.DEFAULT)
     np.random.seed(seed)
@@ -237,10 +238,12 @@ def compile_jit(jit, make_random_inputs, input_keys, make_queues):
       et = time.perf_counter()
       print(f"  [{i+1}/{n_runs}] enqueue {(mt-st)*1e3:6.2f} ms -- total {(et-st)*1e3:6.2f} ms")
 
-      if i == 0:
+      if i == 0 and not skip_validate:
         val = [np.copy(v.numpy()) for v in outs]
         buffers = [np.copy(v.numpy().copy()) for v in input_queues.values()]
 
+    if skip_validate:
+      return [], []
     if test_val is not None:
       match = all(np.array_equal(a, b) for a, b in zip(val, test_val, strict=True))
       assert match == expect_match, f"outputs {'differ from' if expect_match else 'match'} baseline (seed={seed})"
@@ -251,6 +254,9 @@ def compile_jit(jit, make_random_inputs, input_keys, make_queues):
 
   print('capture + replay')
   test_val, test_buffers = random_inputs_run(jit, SEED)
+  if skip_validate:
+    print('skipping pickle validation')
+    return jit
   print('pickle round trip')
   jit = pickle.loads(pickle.dumps(jit))
   random_inputs_run(jit, SEED, test_val, test_buffers, expect_match=True)
@@ -306,6 +312,8 @@ if __name__ == "__main__":
     make_warp_queues = partial(make_warp_input_queues, out['metadata']['input_shapes'], args.frame_skip)
     out[(cam_w,cam_h)] = compile_jit(warp_enqueue, make_random_warp_inputs, WARP_INPUTS, make_warp_queues)
 
-  with open(args.output, "wb") as f:
+  tmp_output = f"{args.output}.tmp"
+  with open(tmp_output, "wb") as f:
     pickle.dump(out, f)
+  os.replace(tmp_output, args.output)
   print(f"Saved JITs to {args.output} ({os.path.getsize(args.output) / 1e6:.2f} MB)")
