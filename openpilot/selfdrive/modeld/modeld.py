@@ -4,6 +4,7 @@ os.environ['GMMU'] = '0' # for usbgpu fast loading, noop for qcom
 from tinygrad.tensor import Tensor
 import time
 import pickle
+import threading
 import numpy as np
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
@@ -14,7 +15,7 @@ from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.realtime import config_realtime_process, DT_MDL
+from openpilot.common.realtime import config_realtime_process, drop_realtime, set_core_affinity, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
@@ -33,6 +34,8 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
+SMALL_MODEL_CORES = [0, 1, 2]
+MAIN_MODEL_CORE = 7
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
@@ -121,7 +124,6 @@ class ModelState:
     self.npy['big_tfm'][:,:] = transforms['big_img'][:,:]
 
     warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames['img'], big_frame=self.full_frames['big_img'])
-
     outs, = self.run_policy(
       **{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped
     )
@@ -134,6 +136,14 @@ class ModelState:
     return outputs_dict
 
 
+def run_model(model: ModelState, buf_main: VisionBuf, buf_extra: VisionBuf,
+              model_transform_main: np.ndarray, model_transform_extra: np.ndarray,
+              inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray] | None:
+  bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
+  transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
+  return model.run(bufs, transforms, inputs)
+
+
 def main(demo=False):
   cloudlog.warning("modeld init")
 
@@ -143,8 +153,8 @@ def main(demo=False):
   params = Params()
   params.put_bool("UsbGpuPresent", _present)
   params.put_bool("UsbGpuCompiled", _compiled)
-
-  config_realtime_process(7, 54)
+  params.put_bool("UsbGpuActive", False)
+  config_realtime_process(SMALL_MODEL_CORES if USBGPU else MAIN_MODEL_CORE, 54)
 
   # visionipc clients
   while True:
@@ -170,9 +180,26 @@ def main(demo=False):
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
   st = time.monotonic()
-  cloudlog.warning("loading model")
-  model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
-  cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
+  cloudlog.warning("loading small model")
+  model = ModelState(vipc_client_main.width, vipc_client_main.height, False)
+  cloudlog.warning(f"small model loaded in {time.monotonic() - st:.1f}s, modeld starting")
+
+  big_model: ModelState | None = None
+
+  def load_big_model() -> None:
+    nonlocal big_model
+    drop_realtime()
+    set_core_affinity([MAIN_MODEL_CORE])
+    try:
+      st = time.monotonic()
+      cloudlog.warning("loading big model")
+      big_model = ModelState(vipc_client_main.width, vipc_client_main.height, True)
+      cloudlog.warning(f"big model loaded in {time.monotonic() - st:.1f}s")
+    except Exception:
+      cloudlog.exception("big model load failed")
+
+  if USBGPU:
+    threading.Thread(target=load_big_model, daemon=True).start()
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
@@ -186,6 +213,22 @@ def main(demo=False):
   frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
+  usbgpu_active = False
+  big_model_output = None
+  big_model_running = False
+
+  def run_big_model(run_buf_main, run_buf_extra, run_tfm_main, run_tfm_extra, run_inputs) -> None:
+    nonlocal big_model_output, big_model_running, big_model, usbgpu_active
+    try:
+      set_core_affinity([MAIN_MODEL_CORE])
+      big_model_output = run_model(big_model, run_buf_main, run_buf_extra, run_tfm_main, run_tfm_extra, run_inputs)
+    except Exception:
+      cloudlog.exception("big model run failed, keeping small model active")
+      big_model = None
+      usbgpu_active = False
+      params.put_bool("UsbGpuActive", False)
+    finally:
+      big_model_running = False
 
   model_transform_main = np.zeros((3, 3), dtype=np.float32)
   model_transform_extra = np.zeros((3, 3), dtype=np.float32)
@@ -270,8 +313,6 @@ def main(demo=False):
 
     frame_drop_ratio = frames_dropped / (1 + frames_dropped)
 
-    bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
-    transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
     frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
     action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
     lat_action_t = lat_delay + frame_delay + action_delay
@@ -283,7 +324,21 @@ def main(demo=False):
     }
 
     mt1 = time.perf_counter()
-    model_output = model.run(bufs, transforms, inputs)
+    model_output = run_model(model, buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
+
+    if big_model_output is not None:
+      model_output = big_model_output
+      big_model_output = None
+      if not usbgpu_active:
+        usbgpu_active = True
+        params.put_bool("UsbGpuActive", True)
+
+    if big_model is not None and not big_model_running and model_output is not None:
+      big_model_running = True
+      run_inputs = {k: v.copy() for k, v in inputs.items()}
+      threading.Thread(target=run_big_model,
+                       args=(buf_main, buf_extra, model_transform_main.copy(), model_transform_extra.copy(), run_inputs),
+                       daemon=True).start()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
