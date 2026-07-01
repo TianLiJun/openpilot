@@ -35,6 +35,9 @@ WIDE_CAM_MAX_SPEED = 5.0  # m/s (10 mph)
 ROAD_CAM_MIN_SPEED = 10  # m/s (25 mph)
 
 CAM_Y_OFFSET = 20
+MODEL_TIMING_FONT_SIZE = 44
+MODEL_TIMING_WIDTH = 300
+MODEL_TIMING_HEIGHT = 118
 
 
 class BookmarkIcon(Widget):
@@ -152,6 +155,7 @@ class AugmentedRoadView(CameraView):
     self._alert_renderer = AlertRenderer()
     self._driver_state_renderer = DriverStateRenderer()
     self._confidence_ball = ConfidenceBall()
+    self._model_timing_font = gui_app.font(FontWeight.MEDIUM)
     self._offroad_label = UnifiedLabel("start the car to\nuse openpilot", 54, FontWeight.DISPLAY,
                                        text_color=rl.Color(255, 255, 255, int(255 * 0.9)),
                                        alignment=rl.GuiTextAlignment.TEXT_ALIGN_CENTER,
@@ -231,6 +235,7 @@ class AugmentedRoadView(CameraView):
                                                alert_to_render.visual_alert == car.CarControl.HUDControl.VisualAlert.steerRequired)
     self._alert_renderer.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
+    self._draw_model_timing(self._content_rect)
 
     # Draw fake rounded border
     rl.draw_rectangle_rounded_lines_ex(self._content_rect, 0.2 * 1.02, 10, 50, rl.BLACK)
@@ -243,6 +248,21 @@ class AugmentedRoadView(CameraView):
     self._confidence_ball.render(self.rect)
 
     self._bookmark_icon.render(self.rect)
+
+  def _draw_model_timing(self, rect: rl.Rectangle):
+    small_ms = ui_state.model_small_execution_time * 1000.0
+    big_ms = ui_state.model_big_execution_time * 1000.0
+    small_selected = not ui_state.model_big_selected
+    small_text = f"small: {small_ms:.0f}ms" if small_ms > 0 else "small: --ms"
+    big_text = f"big: {big_ms:.0f}ms" if big_ms > 0 else "big: --ms"
+    small_color = rl.Color(128, 216, 166, 255) if small_selected else rl.Color(255, 255, 255, 180)
+    big_color = rl.Color(128, 216, 166, 255) if ui_state.model_big_selected else rl.Color(255, 255, 255, 180)
+    x = rect.x + rect.width - MODEL_TIMING_WIDTH - 18
+    y = rect.y + 18
+    rl.draw_rectangle_rounded(rl.Rectangle(x, y, MODEL_TIMING_WIDTH, MODEL_TIMING_HEIGHT), 0.18, 8, rl.Color(0, 0, 0, 205))
+    rl.draw_rectangle_rounded_lines_ex(rl.Rectangle(x, y, MODEL_TIMING_WIDTH, MODEL_TIMING_HEIGHT), 0.18, 8, 2, rl.Color(255, 255, 255, 80))
+    rl.draw_text_ex(self._model_timing_font, small_text, rl.Vector2(x + 20, y + 12), MODEL_TIMING_FONT_SIZE, 0, small_color)
+    rl.draw_text_ex(self._model_timing_font, big_text, rl.Vector2(x + 20, y + 64), MODEL_TIMING_FONT_SIZE, 0, big_color)
 
   def _switch_stream_if_needed(self, sm):
     if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:

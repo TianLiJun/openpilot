@@ -77,6 +77,9 @@ class UIState:
     self.experimental_mode: bool = self.params.get_bool("ExperimentalMode")
     self.usbgpu: bool = self.params.get_bool("UsbGpuPresent")
     self.usbgpu_compiled: bool = self.params.get_bool("UsbGpuCompiled")
+    self.model_small_execution_time: float = self.params.get("ModelSmallExecutionTime", return_default=True)
+    self.model_big_execution_time: float = self.params.get("ModelBigExecutionTime", return_default=True)
+    self.model_big_selected: bool = self.params.get_bool("ModelBigSelected")
     self.started: bool = False
     self.ignition: bool = False
     self.recording_audio: bool = False
@@ -205,6 +208,9 @@ class UIState:
     self.experimental_mode = self.params.get_bool("ExperimentalMode")
     self.usbgpu = self.params.get_bool("UsbGpuPresent")
     self.usbgpu_compiled = self.params.get_bool("UsbGpuCompiled")
+    self.model_small_execution_time = self.params.get("ModelSmallExecutionTime", return_default=True)
+    self.model_big_execution_time = self.params.get("ModelBigExecutionTime", return_default=True)
+    self.model_big_selected = self.params.get_bool("ModelBigSelected")
 
 
 class Device:
