@@ -34,7 +34,7 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
-SMALL_MODEL_CORES = [0, 1, 2]
+SMALL_MODEL_CORES = [0, 1, 2, 3]
 MAIN_MODEL_CORE = 7
 
 
@@ -219,11 +219,12 @@ def main(demo=False):
   usbgpu_active = False
   big_model_output = None
   big_model_running = False
+  big_model_active = False
   small_model_execution_time = 0.0
   big_model_execution_time = 0.0
 
   def run_big_model(run_buf_main, run_buf_extra, run_tfm_main, run_tfm_extra, run_inputs) -> None:
-    nonlocal big_model_output, big_model_running, big_model, usbgpu_active, big_model_execution_time
+    nonlocal big_model_output, big_model_running, big_model, usbgpu_active, big_model_execution_time, big_model_active
     try:
       set_core_affinity([MAIN_MODEL_CORE])
       mt1 = time.perf_counter()
@@ -232,8 +233,10 @@ def main(demo=False):
     except Exception:
       cloudlog.exception("big model run failed, keeping small model active")
       big_model = None
+      big_model_active = False
       usbgpu_active = False
       params.put_bool("UsbGpuActive", False)
+      params.put_bool("ModelBigSelected", False)
       big_model_execution_time = 0.0
     finally:
       big_model_running = False
@@ -331,31 +334,52 @@ def main(demo=False):
       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
     }
 
-    mt1 = time.perf_counter()
-    model_output = run_model(model, buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
-    small_model_execution_time = time.perf_counter() - mt1
-    model_big_selected = False
+    if big_model_active and big_model is not None:
+      try:
+        set_core_affinity([MAIN_MODEL_CORE])
+        mt1 = time.perf_counter()
+        model_output = run_model(big_model, buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
+        big_model_execution_time = time.perf_counter() - mt1
+        model_execution_time = big_model_execution_time
+      except Exception:
+        cloudlog.exception("big model run failed, falling back to small model")
+        big_model = None
+        big_model_active = False
+        usbgpu_active = False
+        params.put_bool("UsbGpuActive", False)
+        params.put_bool("ModelBigSelected", False)
+        big_model_execution_time = 0.0
+        set_core_affinity(SMALL_MODEL_CORES if USBGPU else MAIN_MODEL_CORE)
+        mt1 = time.perf_counter()
+        model_output = run_model(model, buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
+        small_model_execution_time = time.perf_counter() - mt1
+        model_execution_time = small_model_execution_time
+    else:
+      set_core_affinity(SMALL_MODEL_CORES if USBGPU else MAIN_MODEL_CORE)
+      mt1 = time.perf_counter()
+      model_output = run_model(model, buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
+      small_model_execution_time = time.perf_counter() - mt1
+      model_execution_time = small_model_execution_time
 
-    if big_model_output is not None:
-      model_output = big_model_output
-      big_model_output = None
-      model_big_selected = True
-      if not usbgpu_active:
-        usbgpu_active = True
-        params.put_bool("UsbGpuActive", True)
+      if big_model_output is not None:
+        big_model_output = None
+        big_model_active = True
+        set_core_affinity([MAIN_MODEL_CORE])
+        if not usbgpu_active:
+          usbgpu_active = True
+          params.put_bool("UsbGpuActive", True)
 
-    if big_model is not None and not big_model_running and model_output is not None:
-      big_model_running = True
-      run_inputs = {k: v.copy() for k, v in inputs.items()}
-      threading.Thread(target=run_big_model,
-                       args=(buf_main, buf_extra, model_transform_main.copy(), model_transform_extra.copy(), run_inputs),
-                       daemon=True).start()
-    mt2 = time.perf_counter()
-    model_execution_time = mt2 - mt1
+      if not big_model_active and big_model is not None and not big_model_running and model_output is not None:
+        big_model_running = True
+        run_inputs = {k: v.copy() for k, v in inputs.items()}
+        threading.Thread(target=run_big_model,
+                         args=(buf_main, buf_extra, model_transform_main.copy(), model_transform_extra.copy(), run_inputs),
+                         daemon=True).start()
+
     if run_count % (ModelConstants.MODEL_RUN_FREQ // 5) == 0:
       params.put("ModelSmallExecutionTime", small_model_execution_time)
       params.put("ModelBigExecutionTime", big_model_execution_time)
-      params.put_bool("ModelBigSelected", model_big_selected)
+      params.put_bool("ModelBigSelected", big_model_active)
 
     if model_output is not None:
       modelv2_send = messaging.new_message('modelV2')
